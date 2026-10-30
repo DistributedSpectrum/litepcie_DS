@@ -17,6 +17,34 @@ from litex.soc.cores.clock import S7MMCM
 from litepcie.common import *
 from litepcie.phy.common import *
 
+# S7 128-bit RX Byte Enables -----------------------------------------------------------------------
+
+class S7RX128BByteEnables(LiteXModule):
+    """
+    Byte enables for the 7-Series 128-bit RX interface.
+
+    In 128-bit mode, m_axis_rx_tkeep does not mark where a packet ends: is_eof gives the byte
+    offset of the last DW. Keep the lanes up to the EOF DW and, when a new packet starts in the
+    same beat (straddle, is_sof on DW2), the lanes from its SOF DW. Beats without an EOF keep tkeep.
+    """
+    def __init__(self):
+        self.tkeep  = Signal(16)
+        self.is_sof = Signal(5) # [4]: valid, [3:0]: byte offset of the first DW (0 or 8).
+        self.is_eof = Signal(5) # [4]: valid, [3:0]: byte offset of the last byte (3/7/11/15).
+        self.be     = Signal(16)
+
+        # # #
+
+        eof_valid, eof_dw = self.is_eof[4], self.is_eof[2:4]
+        sof_valid, sof_dw = self.is_sof[4], self.is_sof[2:4]
+        for lane in range(4):
+            lane_be = self.be[4*lane:4*(lane + 1)]
+            self.comb += If(eof_valid,
+                lane_be.eq(Replicate((lane <= eof_dw) | (sof_valid & (sof_dw > eof_dw) & (lane >= sof_dw)), 4))
+            ).Else(
+                lane_be.eq(self.tkeep[4*lane:4*(lane + 1)])
+            )
+
 # S7PCIEPHY ----------------------------------------------------------------------------------------
 
 class S7PCIEPHY(LiteXModule):
@@ -266,6 +294,7 @@ class S7PCIEPHY(LiteXModule):
 
         # Hard IP ----------------------------------------------------------------------------------
         m_axis_rx_tlast = Signal()
+        m_axis_rx_tkeep = Signal(len(m_axis_rx.be))
         m_axis_rx_tuser = Signal(32)
         self.cfg_aer_ecrc_gen_en = cfg_aer_ecrc_gen_en = Signal()
         self.s_axis_tx_tuser = s_axis_tx_tuser = Signal(4)
@@ -356,7 +385,7 @@ class S7PCIEPHY(LiteXModule):
             o_m_axis_rx_tlast                            = m_axis_rx_tlast,
             i_m_axis_rx_tready                           = m_axis_rx.ready,
             o_m_axis_rx_tdata                            = m_axis_rx.dat,
-            o_m_axis_rx_tkeep                            = m_axis_rx.be,
+            o_m_axis_rx_tkeep                            = m_axis_rx_tkeep,
             o_m_axis_rx_tuser                            = m_axis_rx_tuser,
 
             # Flow Control
@@ -515,15 +544,21 @@ class S7PCIEPHY(LiteXModule):
         if pcie_data_width == 128:
             rx_is_sof = m_axis_rx_tuser[10:15] # Start of a new packet header in m_axis_rx_tdata.
             rx_is_eof = m_axis_rx_tuser[17:22] # End of a packet in m_axis_rx_tdata.
+            self.rx_byte_enables = rx_byte_enables = S7RX128BByteEnables()
             self.comb += [
                 m_axis_rx.first.eq(rx_is_sof[-1]),
                 m_axis_rx.last.eq( rx_is_eof[-1]),
                 If(rx_is_sof == 0b11000, self.rx_datapath.aligner.first_dword.eq(2)),
+                rx_byte_enables.tkeep.eq(m_axis_rx_tkeep),
+                rx_byte_enables.is_sof.eq(rx_is_sof),
+                rx_byte_enables.is_eof.eq(rx_is_eof),
+                m_axis_rx.be.eq(rx_byte_enables.be),
             ]
         else:
             self.comb += [
                 m_axis_rx.first.eq(0),
                 m_axis_rx.last.eq(m_axis_rx_tlast),
+                m_axis_rx.be.eq(m_axis_rx_tkeep),
             ]
 
     # PTM Receive Sniffer --------------------------------------------------------------------------
